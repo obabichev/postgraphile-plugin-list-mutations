@@ -1,4 +1,4 @@
-const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
+const UpdateListsPlugin = (builder) => {
     builder.hook(
         'GraphQLObjectType:fields',
         (
@@ -7,7 +7,8 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                 extend,
                 getTypeByName,
                 newWithHooks,
-                pgIntrospectionResultsByKind,
+                pgIntrospectionResultsByKind: introspectionResultsByKind,
+                pgColumnFilter: columnFilter,
                 pgSql: sql,
                 gql2pg,
                 graphql: {
@@ -17,8 +18,9 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                     GraphQLString,
                     GraphQLList,
                 },
+                inflection,
             },
-            {scope: {isRootMutation}, fieldWithHooks},
+            { scope: { isRootMutation }, fieldWithHooks },
         ) => {
             if (!isRootMutation) {
                 return fields;
@@ -26,24 +28,31 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
 
             return extend(
                 fields,
-                pgIntrospectionResultsByKind.class
+                introspectionResultsByKind.class
                     .filter(table => !!table.namespace)
                     .filter(table => table.isSelectable)
                     .filter(table => table.isInsertable)
                     .filter(table => table.isUpdatable)
                     .reduce((memo, table) => {
-                        const Table = getTypeByName(
-                            inflection.tableType(table.name, table.namespace.name),
-                        );
+                        const Table = getTypeByName(inflection.domainType(table.type));
 
                         if (!Table) {
                             return memo;
                         }
 
-                        const attributes = pgIntrospectionResultsByKind.attribute
+                        const attributes = introspectionResultsByKind.attribute
                             .filter(attr => attr.classId === table.id);
 
-                        const primaryKeyConstraint = pgIntrospectionResultsByKind.constraint
+                        const attrByFieldName = introspectionResultsByKind.attribute
+                            .filter(attr => attr.classId === table.id)
+                            // .filter(attr => columnFilter(attr, build, context))
+                            .reduce((memo, attr) => {
+                                const fieldName = inflection.column(attr);
+                                memo[fieldName] = attr;
+                                return memo;
+                            }, {});
+
+                        const primaryKeyConstraint = introspectionResultsByKind.constraint
                             .filter(con => con.classId === table.id)
                             .filter(con => con.type === 'p')[0];
 
@@ -63,7 +72,7 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                             return memo;
                         }
 
-                        const tableTypeName = inflection.tableType(table.name, table.namespace.name);
+                        const tableTypeName = inflection.tableType(table);
 
                         const InputTypeListItem = newWithHooks(
                             GraphQLInputObjectType,
@@ -98,7 +107,7 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                                             'An arbitrary string value with no semantic meaning. Will be included in the payload verbatim. May be used to track mutations by the client.',
                                         type: GraphQLString,
                                     },
-                                    [inflection.tableName(table.name, table.namespace.name) + 's']: {
+                                    [inflection.column(table) + 's']: {
                                         description: `The \`${tableTypeName}\` list will updated by this mutation.`,
                                         type: new GraphQLList(InputTypeListItem),
                                     },
@@ -116,17 +125,13 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                                 name: `Update${tableTypeName}ListPayload`,
                                 description: `The output of updating \`${tableTypeName}\` list mutation.`,
                                 fields: () => {
-                                    const tableName = inflection.tableName(
-                                        table.name,
-                                        table.namespace.name,
-                                    );
                                     return {
                                         clientMutationId: {
                                             description:
                                                 'The exact same `clientMutationId` that was provided in the mutation input, unchanged and unused. May be used by a client to track mutations.',
                                             type: GraphQLString,
                                         },
-                                        [tableName]: {
+                                        [inflection.column(table) + 's']: {
                                             description: `The \`${tableTypeName}\` list that was updated by this mutation.`,
                                             type: new GraphQLList(Table),
                                             resolve(data) {
@@ -153,77 +158,65 @@ const UpdateListsPlugin = (builder, {pgInflection: inflection}) => {
                                     type: new GraphQLNonNull(InputType),
                                 },
                             },
-                            async resolve(data, {input}, {pgClient}) {
-                                const inputData = input[inflection.tableName(table.name, table.namespace.name) + 's'];
+                            async resolve(data, { input }, { pgClient }) {
+                                const inputData = input[inflection.column(table) + 's'];
 
                                 const columns = Object.keys(inputData[0].patch);
 
-                                const primaryKeyConstraint = pgIntrospectionResultsByKind.constraint
+                                const primaryKeyConstraint = introspectionResultsByKind.constraint
                                     .filter(con => con.classId === table.id)
                                     .filter(con => con.type === 'p')[0];
 
                                 const primaryKeys =
                                     primaryKeyConstraint &&
                                     primaryKeyConstraint.keyAttributeNums.map(
-                                        num => pgIntrospectionResultsByKind.attribute
+                                        num => introspectionResultsByKind.attribute
                                             .filter(attr => attr.classId === table.id)
                                             .filter(attr => attr.num === num)[0],
                                     );
 
                                 const primaryKey = primaryKeys[0];
 
-                                const attributes = pgIntrospectionResultsByKind.attribute
-                                    .filter(attr => attr.classId === table.id)
-                                    .filter(attr => columns.indexOf(attr.name) >= 0);
+                                const typeCasts = columns.reduce((types, column) => {
+                                    const typeId = attrByFieldName[column].type.id;
 
-                                const sqlColumns = [];
-                                const sqlValues = [];
-                                inputData.forEach(data => {
-                                    sqlValues.push([gql2pg(data.id, primaryKey.type)]);
-                                });
-
-                                const typeCasts = {};
-
-                                attributes.forEach(attr => {
-                                    const field = inflection.column(
-                                        attr.name,
-                                        table.name,
-                                        table.namespace.name,
-                                    );
-
-                                    sqlColumns.push(sql.identifier(attr.name));
-
-                                    inputData.forEach((data, index) => {
-                                        const val = data.patch[field];
-
-                                        if (attr.type.id === '1700') {
-                                            typeCasts[field] = 'numeric';
-                                        }
-                                        if (attr.type.id === '114') {
-                                            typeCasts[field] = 'json';
-                                        }
-
-                                        sqlValues[index].push(gql2pg(val, attr.type));
-                                    });
-                                });
+                                    if (typeId === '1700') {
+                                        types[column] = 'numeric';
+                                    }
+                                    if (typeId === '114') {
+                                        types[column] = 'json';
+                                    }
+                                    return types;
+                                }, {});
 
                                 const joinValues = values => sql.join(values, ', ');
 
                                 const typeCast = column => typeCasts[column.names[0]];
 
+                                const sqlColumns = joinValues(columns.map(column => {
+                                    return sql.identifier(attrByFieldName[column].name);
+                                }));
+
+                                const sqlValues = joinValues(inputData.map(entity => {
+                                    return sql.fragment`(${joinValues([gql2pg(entity.id, primaryKey.type), ...columns.map(column => {
+                                        return gql2pg(entity.patch[column], attrByFieldName[column].type);
+                                    })])})`;
+                                }));
+
+                                const tableTag = sql.identifier(Symbol());
+                                const subTableTag = sql.identifier(Symbol());
+
                                 const query = sql.query`
-                                    update ${sql.identifier(table.namespace.name, table.name)} t
-                                    set ${sql.join(sqlColumns.map(col => typeCast(col)
-                                    ? sql.fragment`${col} = s.${col}::${sql.identifier(typeCast(col))}`
-                                    : sql.fragment`${col} = s.${col}`), ', ')}
-                                    from ( values 
-                                            ${joinValues(sqlValues.map(val => sql.fragment`(${joinValues(val)})`))}
-                                        ) as s (id, ${joinValues(sqlColumns)})
-                                    where t.id = s.id::bigint
+                                    update ${sql.identifier(table.namespace.name, table.name)} ${tableTag}
+                                    set ${joinValues(sqlColumns.map(column => typeCast(column)
+                                    ? sql.fragment`${column} = ${subTableTag}.${column}::${sql.identifier(typeCast(column))}`
+                                    : sql.fragment`${column} = ${subTableTag}.${column}`))}
+                                    from ( values ${sqlValues} ) as s (id, ${sqlColumns})
+                                    where ${tableTag}.${sql.identifier(primaryKey.name)} = ${subTableTag}.id::${sql.identifier(primaryKey.type.name)}
                                     returning *;
                                     `;
 
-                                const {text, values} = sql.compile(query);
+                                const { text, values } = sql.compile(query);
 
                                 const {
                                     rows,
