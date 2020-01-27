@@ -20,7 +20,7 @@ const UpdateListsPlugin = (builder) => {
                 },
                 inflection,
             },
-            { scope: { isRootMutation }, fieldWithHooks },
+            {scope: {isRootMutation}, fieldWithHooks},
         ) => {
             if (!isRootMutation) {
                 return fields;
@@ -34,9 +34,9 @@ const UpdateListsPlugin = (builder) => {
                     .filter(table => table.isInsertable)
                     .filter(table => table.isUpdatable)
                     .reduce((memo, table) => {
-                        const Table = getTypeByName(inflection.domainType(table.type));
+                        const TableType = getTypeByName(inflection.domainType(table.type));
 
-                        if (!Table) {
+                        if (!TableType) {
                             return memo;
                         }
 
@@ -56,19 +56,22 @@ const UpdateListsPlugin = (builder) => {
                             .filter(con => con.classId === table.id)
                             .filter(con => con.type === 'p')[0];
 
-                        const primaryKey = primaryKeyConstraint &&
-                            primaryKeyConstraint.keyAttributeNums.map(
-                                num => attributes.filter(attr => attr.num === num)[0],
-                            )[0];
+                        if (!primaryKeyConstraint) {
+                            return memo;
+                        }
+
+                        const primaryKey = primaryKeyConstraint.keyAttributeNums.map(
+                            num => attributes.filter(attr => attr.num === num)[0],
+                        )[0];
 
                         if (!primaryKey) {
                             return memo;
                         }
 
-                        const BigInt = getTypeByName('BigInt');
+                        const PrimaryKeyType = TableType.getFields()[primaryKey.name].type;
 
-                        const TableInput = getTypeByName(inflection.patchType(Table.name));
-                        if (!TableInput) {
+                        const TablePatchType = getTypeByName(inflection.patchType(TableType.name));
+                        if (!TablePatchType) {
                             return memo;
                         }
 
@@ -82,11 +85,11 @@ const UpdateListsPlugin = (builder) => {
                                 fields: {
                                     id: {
                                         description: primaryKey.name,
-                                        type: BigInt,
+                                        type: PrimaryKeyType,
                                     },
                                     patch: {
                                         description: `The \`${tableTypeName}\` item will updated by this mutation.`,
-                                        type: new GraphQLNonNull(TableInput),
+                                        type: new GraphQLNonNull(TablePatchType),
                                     },
                                 },
                             },
@@ -133,7 +136,7 @@ const UpdateListsPlugin = (builder) => {
                                         },
                                         [inflection.column(table) + 's']: {
                                             description: `The \`${tableTypeName}\` list that was updated by this mutation.`,
-                                            type: new GraphQLList(Table),
+                                            type: new GraphQLList(TableType),
                                             resolve(data) {
                                                 return data.data;
                                             },
@@ -158,7 +161,7 @@ const UpdateListsPlugin = (builder) => {
                                     type: new GraphQLNonNull(InputType),
                                 },
                             },
-                            async resolve(data, { input }, { pgClient }) {
+                            async resolve(data, {input}, {pgClient}) {
                                 const inputData = input[inflection.column(table) + 's'];
 
                                 const columns = Object.keys(inputData[0].patch);
@@ -177,21 +180,7 @@ const UpdateListsPlugin = (builder) => {
 
                                 const primaryKey = primaryKeys[0];
 
-                                const typeCasts = columns.reduce((types, column) => {
-                                    const typeId = attrByFieldName[column].type.id;
-
-                                    if (typeId === '1700') {
-                                        types[column] = 'numeric';
-                                    }
-                                    if (typeId === '114') {
-                                        types[column] = 'json';
-                                    }
-                                    return types;
-                                }, {});
-
                                 const joinValues = values => sql.join(values, ', ');
-
-                                const typeCast = column => typeCasts[column.names[0]];
 
                                 const sqlColumns = joinValues(columns.map(column => {
                                     return sql.identifier(attrByFieldName[column].name);
@@ -208,15 +197,15 @@ const UpdateListsPlugin = (builder) => {
 
                                 const query = sql.query`
                                     update ${sql.identifier(table.namespace.name, table.name)} ${tableTag}
-                                    set ${joinValues(sqlColumns.map(column => typeCast(column)
-                                    ? sql.fragment`${column} = ${subTableTag}.${column}::${sql.identifier(typeCast(column))}`
-                                    : sql.fragment`${column} = ${subTableTag}.${column}`))}
-                                    from ( values ${sqlValues} ) as s (id, ${sqlColumns})
+                                    
+                                    set ${joinValues(columns.map(column => sql.fragment`${sql.identifier(attrByFieldName[column].name)} = ${subTableTag}.${sql.identifier(attrByFieldName[column].name)}::${sql.identifier(attrByFieldName[column].type.namespaceName, attrByFieldName[column].type.name)}`))}
+                            
+                                    from ( values ${sqlValues} ) as ${subTableTag} (id, ${sqlColumns})
                                     where ${tableTag}.${sql.identifier(primaryKey.name)} = ${subTableTag}.id::${sql.identifier(primaryKey.type.name)}
                                     returning *;
                                     `;
 
-                                const { text, values } = sql.compile(query);
+                                const {text, values} = sql.compile(query);
 
                                 const {
                                     rows,
